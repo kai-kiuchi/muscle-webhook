@@ -1,16 +1,13 @@
 import { createClient } from '@supabase/supabase-js';
 import axios from 'axios';
 
-const supabase = createClient(
-  process.env.SUPABASE_URL!,
-  process.env.SUPABASE_ANON_KEY!
-);
-
-const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN!;
-
 export async function POST(request: Request) {
+  console.log('=== Webhook received at', new Date().toISOString(), '===');
+
   try {
     const body = await request.json();
+    console.log('Received events count:', body.events?.length || 0);
+
     const events = body.events || [];
 
     for (const event of events) {
@@ -19,11 +16,19 @@ export async function POST(request: Request) {
         const messageId = event.message.id;
         const replyToken = event.replyToken;
 
-        // LINEから画像データ取得
+        const lineToken = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+        if (!lineToken) {
+          console.error('CRITICAL ERROR: LINE_CHANNEL_ACCESS_TOKEN is missing in environment variables');
+          return new Response('Server configuration error', { status: 500 });
+        }
+
+        console.log(`Processing image for user: ${userId}`);
+
+        // LINEから画像を取得
         const imageResponse = await axios.get(
           `https://api-data.line.me/v2/bot/message/${messageId}/content`,
           {
-            headers: { Authorization: `Bearer ${LINE_TOKEN}` },
+            headers: { Authorization: `Bearer ${lineToken}` },
             responseType: 'arraybuffer',
           }
         );
@@ -31,7 +36,12 @@ export async function POST(request: Request) {
         const timestamp = Date.now();
         const fileName = `${userId}/${timestamp}.jpg`;
 
-        // Supabase Storageに保存
+        const supabase = createClient(
+          process.env.SUPABASE_URL!,
+          process.env.SUPABASE_ANON_KEY!
+        );
+
+        // Supabase Storageにアップロード
         const { error: uploadError } = await supabase.storage
           .from('muscle-photos')
           .upload(fileName, imageResponse.data, {
@@ -39,34 +49,39 @@ export async function POST(request: Request) {
             upsert: true,
           });
 
-        if (uploadError) throw uploadError;
+        if (uploadError) {
+          console.error('Upload error:', uploadError);
+          throw uploadError;
+        }
 
         const { data: urlData } = supabase.storage
           .from('muscle-photos')
           .getPublicUrl(fileName);
 
-        // データベースに記録
+        // データベースに保存
         await supabase.from('muscle_records').insert({
           user_id: userId,
           image_url: urlData.publicUrl,
           record_date: new Date().toISOString().split('T')[0],
         });
 
-        // 返信
+        console.log('Successfully saved image for user:', userId);
+
+        // LINEに返信
         await axios.post(
           'https://api.line.me/v2/bot/message/reply',
           {
             replyToken,
-            messages: [{ type: 'text', text: '💪 筋トレ写真を保存しました！\nこれからも毎日送って記録続けよう！' }],
+            messages: [{ type: 'text', text: '💪 筋トレ写真を保存しました！' }],
           },
-          { headers: { Authorization: `Bearer ${LINE_TOKEN}` } }
+          { headers: { Authorization: `Bearer ${lineToken}` } }
         );
       }
     }
 
     return new Response('OK', { status: 200 });
-  } catch (error) {
-    console.error('Error:', error);
-    return new Response('Error', { status: 500 });
+  } catch (error: any) {
+    console.error('Webhook Error:', error.message || error);
+    return new Response('Internal Server Error', { status: 500 });
   }
 }
